@@ -1,0 +1,363 @@
+---
+title: "AI Applications in Infection Biology"
+author: "Jakob Wirbel and Georg Zeller"
+date: "2024-05-21"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    keep_md: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+In order to get started, we should first prepare our `R` environment and load
+the packages we will need later on. Additionally, the data used in this 
+practical are stored on Zenodo and we can set the base path for the downloads.
+
+## Preparing the R environment
+
+```{R prep, message=FALSE}
+library("tidyverse") # for general data wrangling and plotting
+library("SIAMCAT")   # for statistical and ML analyses
+
+data.loc <- 'https://zenodo.org/api/files/d81e429c-870f-44e0-a44a-2a4aa541b6c1/'
+```
+
+## Loading the data
+
+In this practical, we are going to have a look at the data from
+[Zeller et al. _MSB_ 2014](https://doi.org/10.15252/msb.20145645). In this 
+study, the authors recruited patients with **colorectal cancer (CRC)** 
+and **healthy controls (CTR)** and performed shotgun metagenomic sequencing 
+of fecal samples. The raw data have already been pre-processed and analyzed 
+with the [mOTUs](https://doi.org/10.1038/s41467-019-08844-4) taxonomic 
+profiler.
+
+## Features
+
+First, we are going to load the taxonomic profiles and store them as a matrix.
+
+```{R load_data, message=FALSE, warning=FALSE}
+fn.feat.fr  <- paste0(data.loc, 'specI_Zeller.tsv')
+feat.fr  <- read.table(fn.feat.fr, sep='\t', quote="",
+    check.names = FALSE, stringsAsFactors = FALSE)
+feat.fr <- as.matrix(feat.fr)
+```
+
+## Metadata
+
+Additionally, we also need the information which sample belongs to which group.
+Therefore, we are loading the metadata table as well:
+
+```{R load_metadata, message=FALSE}
+fn.meta.fr  <- paste0(data.loc, 'meta_Zeller.tsv')
+df.meta <- read.table(fn.meta.fr)
+df.meta
+table(df.meta$Group)
+```
+
+
+## Library size & low-abundance filtering
+
+First, we can have a look at the library size across samples:
+```{R histogram}
+options(repr.plot.width=5, repr.plot.height=5)
+hist(colSums(feat.fr), 30, col='slategray', 
+     main='Library Size Histogram', xlab='Library Size')
+```
+
+The above plots strongly suggests to correct for differences in library size. 
+Here we use the simplest approach: conversion to relative abundances (aslo 
+known as total sum scaling). Alternatives are rarefying (i.e. downsampling) 
+or DESeq's library size normalization...
+
+```{R rel_ab}
+feat.fr.rel <- prop.table(feat.fr, 2)
+```
+
+Next, we can have a look at the prevalence of the bacterial features across
+all samples. The assumption would be that features that are present in only
+a handful of samples are unlikely to play a major role in the gut
+ecosystem and their quantification has the greatest uncertainty.
+
+```{R prev}
+options(repr.plot.width=8, repr.plot.height=5)
+hist(rowMeans(feat.fr.rel != 0), 100, col='slategray',
+     xlab='Prevalence of bacterial species', main='Prevalence histogram')
+```
+
+Most of the features are present in none or only a few of the samples and we
+can therefore discard them.
+
+```{R filtering}
+f.idx <- names(which(rowMeans(feat.fr.rel != 0) > 0.05))
+
+# remove the Unmapped part as well
+f.idx <- setdiff(f.idx, 'UNMAPPED')
+
+feat.fr.rel.filt <- feat.fr.rel[f.idx,]
+```
+
+How does the abundance vary across these different bacterial features?
+
+```{R rank_ab_plot}
+# resize plots in Jupyter Notebook to more convenient dimensions
+options(repr.plot.width=8, repr.plot.height=5)
+
+# rank-abundance plot
+rnk <- order(apply(feat.fr.rel.filt, 1, median), decreasing=TRUE)
+boxplot(log10(t(feat.fr.rel.filt[rnk,]) + 1E-6), las=2, cex=0.3, pch=16, lty=1,
+        col='slategray', 
+        xlab='Species rank', ylab='Relative abundance (log10)', xaxt='n')
+```
+
+Let's take two examples and visualize them. The top feature is 
+_Bacteroides dorei_/ _Bacteroides vulgatus_:
+
+```{R b_dorei}
+ # resize plots in Jupyter Notebook to more convenient dimensions
+options(repr.plot.width=5, repr.plot.height=5)
+
+# one of the most abundant species
+hist(log10(feat.fr.rel.filt[40,] + 1E-6), 20,
+     col='slategray', main='Histogram (B. vulgatus)', 
+     xlab='log10(Relative Abundance)')
+```
+
+A bacterium with a more bi-modal distribution is _Prevotella copri_:
+```{R p_copri}
+ # resize plots in Jupyter Notebook to more convenient dimensions
+options(repr.plot.width=5, repr.plot.height=5)
+
+# one of the most abundant species
+hist(log10(feat.fr.rel.filt[20,] + 1E-6), 20,
+     col='slategray', main='Histogram (P. copri)', 
+     xlab='log10(Relative Abundance)')
+```
+
+# Association Testing
+
+Now that we have set up everything, we can test all microbial species 
+for statistically significant differences between the `CTR` and `CRC` groups. 
+In order to do so, we perform a Wilcoxon test on each individual 
+bacterial species. Let's start with one of the species:
+
+```{r assoc_one}
+x <- feat.fr.rel.filt[40,]
+y <- df.meta$Group
+wilcox.test(x~y)
+```
+
+The result seems to be that there is no significant difference in the relative
+abundance of _Bacteroides dorei/vulgatus_ between these two groups. We can also
+visualize this with a boxplot:
+
+```{r assoc_one_box}
+boxplot(log10(x+1E-06)~y, xlab='', ylab='log10(Relative Abundance)',
+        main='B. dorei difference', col=c('firebrick', 'slategrey'))
+```
+
+Now, we can just run this test for all individual bacteria:
+
+```{r assoc_testing}
+p.vals <- rep_len(1, nrow(feat.fr.rel.filt))
+names(p.vals) <- rownames(feat.fr.rel.filt)
+stopifnot(all(rownames(df.meta) == colnames(feat.fr.rel.filt)))
+for (i in rownames(feat.fr.rel.filt)){
+  x <- feat.fr.rel.filt[i,]
+  y <- df.meta$Group
+  t <- wilcox.test(x~y)
+  p.vals[i] <- t$p.value
+}
+head(sort(p.vals))
+```
+
+The species with the most significant effect seems to be a 
+_Fusobacterium_ species, so let us take a look at 
+the distribution of this species:
+
+```{r assoc_box_fuso}
+x <- feat.fr.rel.filt['unclassified Fusobacterium [Cluster1482]',]
+boxplot(log10(x+1E-06)~y, xlab='', ylab='log10(Relative Abundance)',
+        main='Fusobacterium difference', col=c('firebrick', 'slategrey'))
+```
+
+
+# Machine Learning with SIAMCAT
+
+Today, we will use the `SIAMCAT` package to train machine learning models
+on microbiome data. All the data are stored in the `SIAMCAT` object which 
+contains the feature matrix, the metadata, and information about the 
+groups you want to compare.
+
+```{r sc.obj}
+sc.obj <- siamcat(feat=feat.fr.rel, meta=df.meta, 
+                  label='Group', case='CRC')
+```
+
+We can use `SIAMCAT` for feature filtering as well:
+
+```{r sc_filtering}
+sc.obj <- filter.features(sc.obj, filter.method = 'prevalence', cutoff = 0.05)
+sc.obj
+```
+
+
+## Normalization
+
+`SIAMCAT` offers a few normalization approaches that can be useful for
+subsequent statistical modeling in the sense that they transform features in
+a way that can increase the accuracy of the resulting models. Importantly,
+these normalization techniques do not make use of any label information
+(patient status), and can thus be applied up front to the whole data set 
+(and outside of the following cross validation).
+
+```{r normalization}
+sc.obj <- normalize.features(sc.obj, norm.method = 'log.std',
+                             norm.param = list(log.n0=1e-06, sd.min.q=0))
+sc.obj
+```
+
+
+## Cross Validation Split
+
+Cross validation is a technique to assess how well an ML model would generalize 
+to external data by partionining the dataset into training and test sets.
+Here, we split the dataset into 10 parts and then train a model on 9 of these
+parts and use the left-out part to test the model. The whole process is 
+repeated 10 times.
+
+```{r cv}
+sc.obj <- create.data.split(sc.obj, num.folds = 10, num.resample = 10)
+```
+
+
+## Model Training
+
+Now, we can train a
+[LASSO logistic regression classifier](https://www.jstor.org/stable/2346178)
+in order to distinguish CRC cases and controls.
+
+```{r training}
+sc.obj <- train.model(sc.obj, method='lasso')
+```
+
+
+## Predictions
+
+This function will automatically apply the models trained in cross validation 
+to their respective test sets and aggregate the predictions across the whole 
+data set.
+
+```{r predictions}
+sc.obj <- make.predictions(sc.obj)
+```
+
+## Model Evaluation
+
+Calling the `evaluate.predictions` function will result in an assessment of
+precision and recall as well as in ROC analysis, both of which can be plotted
+as a pdf file using the `model.evaluation.plot` function (the name of/path to
+the pdf file is passed as an argument).
+
+```{r evaluate_predictions}
+sc.obj <- evaluate.predictions(sc.obj)
+model.evaluation.plot(sc.obj, fn.plot = './figures/eval_plot.pdf')
+```
+
+![](./figures/eval_plot.png)
+## Model Interpretation
+
+Finally, the `model.interpretation.plot` function will plot characteristics 
+of the models (i.e. model coefficients or feature importance) alongside the 
+input data aiding in understanding how / why the model works (or not).
+
+```{r interpreation_plot}
+model.interpretation.plot(sc.obj, consens.thres = 0.7,
+                          fn.plot = './figures/interpretation_plot.pdf')
+```
+![](./figures/interpretation_plot.png)
+
+# Exercises
+
+## Data visualization
+
+* What could be a good effect size for microbiome data? Calculate the fold
+change between groups and plot a volcano plot. What do you observe?
+
+* You can perform association testing with the `SIAMCAT` package as well. The
+results are stored in the `SIAMCAT` object and can be extracted by using
+`associations(sc.obj)`, if you want to have a closer look at the results for
+yourself. Plot a volcano plot of the associations between cancer and controls 
+using the output from `SIAMCAT`.
+
+* **Optional** Create a ordination plot for our data and colour the samples 
+by group. How would you interpret the results? Try out different ecological 
+distances. How does the choice of distance affect the group separation?
+(**Tip**: make sure to check out the `vegdist` function in the **vegan** 
+package and also the `pco` function in the **labdsv** package)
+
+## Machine learning variations
+
+* We used the `log.std` normalization for our example. Try out different 
+normalization procedures and observe the effect on model performance
+
+* How does the model performance change if you use another machine learning
+algorithm? Do the different algorithms select different features?
+
+## Predictions on external data
+
+The same Zenodo repository also contains data from another CRC microbiome study
+by [Yu et al.](https://gut.bmj.com/content/66/1/70.short). The participants for
+this study were recruited in Austria, so you can read in the data by using 
+these paths to the data:
+```{r external}
+fn.meta.at  <- paste0(data.loc, 'meta_Yu.tsv')
+fn.feat.at  <- paste0(data.loc, 'specI_Yu.tsv')
+```
+
+* Apply the trained model on this dataset and check the model performance 
+on the external dataset. (**Tip**: Check out the help for the `make.prediction`
+function in `SIAMCAT`)
+
+* Train a `SIAMCAT` model on the Austrian dataset and apply it to the French 
+dataset. How does the model transfer on the external dataset compare between
+the two datasets? Compare also the feature weights when training on the French
+or Austrian dataset.  
+**Note**: You can supply several `SIAMCAT` objects to the function 
+`model.evaluation.plot` and compare two ROC curves in the same plot.
+
+## Another disease
+
+If you are way too fast and have too much time, the Zenodo repository also 
+contains data for several studies investigating the microbiome in Crohn's 
+disease patients (`CD`). Explore the (meta)-data first, then try to build ML 
+models for each study and check how well they can be transferred to the other
+datasets. 
+Since this exercise is a bit more exploratory, there will be no solution for it
+in this Github repository, but you can check out the 
+[SIAMCAT vignette](https://siamcat.embl.de/articles/SIAMCAT_meta.html) and
+the [SIAMCAT publication](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02306-1) 
+for some reference (especially Figures 2, 3, and 6).
+
+# Further Information
+
+You can find more information about `SIAMCAT` on https://siamcat.embl.de 
+or on Bioconductor under 
+https://www.bioconductor.org/packages/release/bioc/html/SIAMCAT.html
+
+There you can also find several vignettes which go into more detail about 
+different applications for `SIAMCAT`.
+
+# SessionInfo
+
+```{R}
+sessionInfo()
+```
