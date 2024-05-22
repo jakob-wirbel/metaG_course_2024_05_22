@@ -8,7 +8,8 @@
 
 In order to get started, we should first prepare our `R` environment and load
 the packages we will need later on. Additionally, the data used in this 
-practical are stored on Zenodo and we can set the base path for the downloads.
+practical are stored on [Zenodo](https://zenodo.org/records/7117162) and we 
+can set the base path for the downloads.
 
 ## Preparing the R environment
 
